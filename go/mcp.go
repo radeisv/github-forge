@@ -28,7 +28,8 @@ func mcpToolsBytes() []byte {
 
 var mcpVersions = []string{"2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}
 
-// mcp handles POST /mcp. Caller holds the store lock.
+// mcp handles POST /mcp. It takes its own store lock, per method (see
+// the switch below); the caller holds none.
 func (s *server) mcp(rq *request) *response {
 	v, ok := parseJSON(rq.body)
 	if !ok {
@@ -45,6 +46,28 @@ func (s *server) mcp(rq *request) *response {
 		return &response{status: 202, contentType: jsonCT, body: []byte{}}
 	}
 	params, _ := jobj(m["params"])
+
+	// Lock only as much as the method needs. The read-only methods
+	// touch nothing in the store; read-only tools take a read lock so
+	// concurrent reads are not serialised behind them; only the
+	// mutating tools take the write lock.
+	switch method {
+	case "server/discover", "initialize", "ping", "tools/list":
+		// no store access; no lock
+	case "tools/call":
+		toolName, _ := jstr(params["name"])
+		switch strings.ToLower(toolName) {
+		case "create_repo", "create_issue", "create_pull_request", "merge_pull_request":
+			s.store.mu.Lock()
+			defer s.store.mu.Unlock()
+		default:
+			s.store.mu.RLock()
+			defer s.store.mu.RUnlock()
+		}
+	default:
+		s.store.mu.RLock()
+		defer s.store.mu.RUnlock()
+	}
 
 	// envelope helpers
 	result := func(res []byte) *response {

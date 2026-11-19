@@ -477,7 +477,17 @@ func (s *server) gitFetchV2(rq *request, r *Repo) *response {
 	}
 	fa := parseFetchArgs(pkts)
 	cacheKey := fetchCacheKey(fa)
-	if cached, ok := r.packCached(cacheKey); ok {
+	// Singleflight the pack build: 50 concurrent clones of one repo
+	// all ask for the same pack. Holding cacheMu across the cache
+	// check, the fetch and the store means only the first builds it;
+	// the rest wait briefly and hit the cache instead of each
+	// zlib-compressing the same objects on a shared CPU. Lock order
+	// stays store -> cacheMu (the caller holds the store read lock,
+	// and invalidatePackCache runs only under the store write lock),
+	// so this cannot deadlock.
+	r.cacheMu.Lock()
+	if cached, ok := r.packCache[cacheKey]; ok {
+		r.cacheMu.Unlock()
 		return &response{status: 200, contentType: uploadResCT, body: cached}
 	}
 	objects, shallowLines := r.fetchPack(fa)
@@ -497,7 +507,8 @@ func (s *server) gitFetchV2(rq *request, r *Repo) *response {
 		body = append(body, sidebandPackets(writePack(objects))...)
 	}
 	body = append(body, []byte(pktFlush)...)
-	r.packStore(cacheKey, body)
+	r.packCache[cacheKey] = body
+	r.cacheMu.Unlock()
 	return &response{status: 200, contentType: uploadResCT, body: body}
 }
 
@@ -570,6 +581,14 @@ func (s *server) gitFetchV0(rq *request, r *Repo) *response {
 			}
 		}
 	}
+	// Same singleflight cache as the v2 path, under a distinct key
+	// (the v0 body has no acknowledgments/shallow-info framing).
+	cacheKey := "v0:" + fetchCacheKey(fa)
+	r.cacheMu.Lock()
+	if cached, ok := r.packCache[cacheKey]; ok {
+		r.cacheMu.Unlock()
+		return &response{status: 200, contentType: uploadResCT, body: cached}
+	}
 	objects, _ := r.fetchPack(fa)
 	var body []byte
 	body = append(body, pktString("NAK\n")...)
@@ -577,6 +596,8 @@ func (s *server) gitFetchV0(rq *request, r *Repo) *response {
 		body = append(body, sidebandPackets(writePack(objects))...)
 	}
 	body = append(body, []byte(pktFlush)...)
+	r.packCache[cacheKey] = body
+	r.cacheMu.Unlock()
 	return &response{status: 200, contentType: uploadResCT, body: body}
 }
 

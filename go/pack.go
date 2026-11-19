@@ -9,9 +9,17 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
 )
 
 var errPack = errors.New("bad packfile")
+
+// zlibWriterPool reuses compressors across pack writes; a writer is
+// Reset to a fresh buffer for each object, so pooled state never leaks
+// from one pack into another.
+var zlibWriterPool = sync.Pool{
+	New: func() any { return zlib.NewWriter(io.Discard) },
+}
 
 // readPack parses a packfile, verifies its trailer checksum and every
 // object's hash, and returns the objects in pack order.
@@ -125,9 +133,11 @@ func writePack(objects []*obj) []byte {
 			code = 4
 		}
 		writePackVarint(&buf, code, len(o.data))
-		zw := zlib.NewWriter(&buf)
+		zw := zlibWriterPool.Get().(*zlib.Writer)
+		zw.Reset(&buf)
 		zw.Write(o.data)
 		zw.Close()
+		zlibWriterPool.Put(zw)
 	}
 	sum := sha1.Sum(buf.Bytes())
 	buf.Write(sum[:])

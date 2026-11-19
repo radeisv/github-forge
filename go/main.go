@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"net"
 	"os"
 	"os/signal"
@@ -65,7 +66,9 @@ func (s *server) dispatch(rq *request) *response {
 		if rq.method != "POST" {
 			return notFoundJSON("")
 		}
-		if strings.Contains(string(rq.body), "mutation") {
+		// bytes.Contains on the raw body: the old code converted the
+		// whole body to a string first, one throwaway copy per query.
+		if bytes.Contains(rq.body, []byte("mutation")) {
 			s.store.mu.Lock()
 			defer s.store.mu.Unlock()
 		} else {
@@ -74,13 +77,14 @@ func (s *server) dispatch(rq *request) *response {
 		}
 		return s.graphql(rq)
 	}
-	// MCP
+	// MCP: no lock is taken here. mcp() locks per method — read-only
+	// methods take none, read-only tools take a read lock, and only
+	// the mutating tools take the write lock — so a tools/list or
+	// get_repo no longer serialises behind every other MCP call.
 	if len(segs) == 1 && segs[0] == "mcp" {
 		if rq.method != "POST" {
 			return notFoundJSON("")
 		}
-		s.store.mu.Lock()
-		defer s.store.mu.Unlock()
 		return s.mcp(rq)
 	}
 	// git smart HTTP: /{owner}/{repo}.git/...

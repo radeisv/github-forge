@@ -115,20 +115,6 @@ type Repo struct {
 	cachedRepo    []byte
 }
 
-// packCached returns the cached pack bytes for key, if present.
-func (r *Repo) packCached(key string) ([]byte, bool) {
-	r.cacheMu.Lock()
-	defer r.cacheMu.Unlock()
-	b, ok := r.packCache[key]
-	return b, ok
-}
-
-func (r *Repo) packStore(key string, body []byte) {
-	r.cacheMu.Lock()
-	defer r.cacheMu.Unlock()
-	r.packCache[key] = body
-}
-
 type Store struct {
 	mu            sync.RWMutex
 	repos         map[string]*Repo // owner + "/" + name -> repo
