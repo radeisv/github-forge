@@ -21,6 +21,58 @@ var zlibWriterPool = sync.Pool{
 	New: func() any { return zlib.NewWriter(io.Discard) },
 }
 
+// zlibReaderPool reuses decompressors across pack reads. A pooled
+// reader is Reset to a fresh sliceReader for each object; the pool
+// only ever holds readers whose last stream ended cleanly.
+var zlibReaderPool = sync.Pool{
+	New: func() any {
+		zr, err := zlib.NewReader(bytes.NewReader(emptyZlibStream))
+		if err != nil {
+			return nil
+		}
+		return zr
+	},
+}
+
+// emptyZlibStream is a valid zlib stream for zero bytes, used only to
+// seed a pooled decompressor (zlib.NewReader refuses an empty input).
+var emptyZlibStream = func() []byte {
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	zw.Close()
+	return buf.Bytes()
+}()
+
+// sliceReader is a zero-allocation io.Reader over a byte slice that
+// reports how many bytes were consumed, so a pooled zlib reader can
+// be Reset onto it and the pack parser knows where the next object
+// starts without allocating a bytes.Reader per object.
+// It implements io.ByteReader: without ReadByte, the flate
+// decompressor buffers ahead and silently swallows bytes that belong
+// to the next object.
+type sliceReader struct {
+	b   []byte
+	off int
+}
+
+func (r *sliceReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.b) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b[r.off:])
+	r.off += n
+	return n, nil
+}
+
+func (r *sliceReader) ReadByte() (byte, error) {
+	if r.off >= len(r.b) {
+		return 0, io.EOF
+	}
+	c := r.b[r.off]
+	r.off++
+	return c, nil
+}
+
 // readPack parses a packfile, verifies its trailer checksum and every
 // object's hash, and returns the objects in pack order.
 func readPack(pack []byte) ([]*obj, error) {
@@ -65,21 +117,39 @@ func readPack(pack []byte) ([]*obj, error) {
 			// OFS_DELTA (6) / REF_DELTA (7) are never sent by the client.
 			return nil, errPack
 		}
-		br := bytes.NewReader(pack[off:])
-		zr, err := zlib.NewReader(br)
-		if err != nil {
+		// One pre-sized buffer for the object: the old code grew one
+		// via io.ReadAll over a LimitReader and allocated a fresh
+		// zlib reader per object.
+		data := make([]byte, size)
+		sr := &sliceReader{b: pack[off:]}
+		zr, _ := zlibReaderPool.Get().(io.ReadCloser)
+		if zr == nil {
+			var err error
+			zr, err = zlib.NewReader(sr)
+			if err != nil {
+				return nil, errPack
+			}
+		} else if err := zr.(interface{ Reset(io.Reader, []byte) error }).Reset(sr, nil); err != nil {
+			// a reader whose Reset fails is dropped, never re-pooled
 			return nil, errPack
 		}
-		data, err := io.ReadAll(io.LimitReader(zr, int64(size)+1))
+		if _, err := io.ReadFull(zr, data); err != nil {
+			zr.Close()
+			zlibReaderPool.Put(zr)
+			return nil, errPack
+		}
+		// the stream must end exactly at size: one extra byte means
+		// the declared size lied
+		var one [1]byte
+		if n, _ := zr.Read(one[:]); n != 0 {
+			zr.Close()
+			zlibReaderPool.Put(zr)
+			return nil, errPack
+		}
 		zr.Close()
-		if err != nil {
-			return nil, errPack
-		}
-		if len(data) != size {
-			return nil, errPack
-		}
-		// bytes consumed = what the zlib reader pulled from br.
-		off += len(pack[off:]) - br.Len()
+		zlibReaderPool.Put(zr)
+		// bytes consumed = what the zlib reader pulled from sr.
+		off += sr.off
 		objects = append(objects, &obj{typ: typName, data: data})
 	}
 	if off != len(pack)-20 {

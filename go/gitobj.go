@@ -23,11 +23,18 @@ type obj struct {
 }
 
 func hashObject(typ string, data []byte) string {
+	// Header "type len\0" built on the stack: the old code allocated
+	// three throwaway []byte slices per hash, and a push hashes every
+	// object it stores.
+	var hdr [48]byte
+	n := copy(hdr[:], typ)
+	hdr[n] = ' '
+	n++
+	n += copy(hdr[n:], itoa(len(data)))
+	hdr[n] = 0
+	n++
 	h := sha1.New()
-	h.Write([]byte(typ))
-	h.Write([]byte(" "))
-	h.Write([]byte(itoa(len(data))))
-	h.Write([]byte{0})
+	h.Write(hdr[:n])
 	h.Write(data)
 	sum := h.Sum(nil)
 	return hexEncode(sum)

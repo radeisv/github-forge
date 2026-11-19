@@ -94,7 +94,7 @@ func (s *server) gitAdvertisement(rq *request, owner, repoName, service string) 
 	}
 	refs := r.sortedRefs()
 	tips := r.refs
-	v2 := service == "git-upload-pack" && rq.header("git-protocol") == "version=2"
+	v2 := service == "git-upload-pack" && rq.gitProtocol == "version=2"
 	var body []byte
 	if service == "git-upload-pack" && v2 {
 		// No "# service=" preamble here: git protocol v2 starts with
@@ -458,7 +458,7 @@ func sidebandPackets(data []byte) []byte {
 // gitUploadPack dispatches a POST /git-upload-pack to v2 or v0 by the
 // Git-Protocol header.
 func (s *server) gitUploadPack(rq *request, r *Repo) *response {
-	if rq.header("git-protocol") == "version=2" {
+	if rq.gitProtocol == "version=2" {
 		return s.gitFetchV2(rq, r)
 	}
 	return s.gitFetchV0(rq, r)
@@ -663,9 +663,9 @@ func (s *server) gitReceivePack(rq *request, r *Repo) *response {
 		for _, o := range packObjs {
 			oid := hashObject(o.typ, o.data)
 			if _, exists := r.objects[oid]; !exists {
-				cp := make([]byte, len(o.data))
-				copy(cp, o.data)
-				r.objects[oid] = &obj{typ: o.typ, data: cp}
+				// readPack already hands us a fresh buffer per object;
+				// the old code copied it a second time here.
+				r.objects[oid] = &obj{typ: o.typ, data: o.data}
 			}
 		}
 	}

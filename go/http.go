@@ -5,6 +5,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -16,23 +18,120 @@ type request struct {
 	path    string // decoded path, no query
 	query   string
 	rawPath string
-	headers map[string]string // lower-cased keys
-	body    []byte
 	host    string
+	// Headers, parsed once into fields. The old code kept a
+	// map[string]string and lower-cased every name and value on
+	// every lookup (authorization, host, expect, content-length,
+	// transfer-encoding, connection, git-protocol), so one request
+	// paid for a dozen small allocations before dispatch ran.
+	auth           string // raw Authorization value
+	contentLength  int    // -1 when absent
+	chunked        bool
+	expectContinue bool
+	connClose      bool
+	connKeepAlive  bool
+	gitProtocol    string
+	http10         bool
+	body           []byte
 	// parsed helpers
 	segments []string
 }
 
-func (rq *request) header(name string) string {
-	return rq.headers[strings.ToLower(name)]
-}
-
 func (rq *request) bearer() string {
-	h := rq.header("authorization")
+	h := rq.auth
 	if strings.HasPrefix(h, "Bearer ") {
 		return h[len("Bearer "):]
 	}
 	return ""
+}
+
+// foldEq reports whether b equals s ignoring ASCII case (no allocation).
+func foldEq(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
+	for i := range b {
+		c := b[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != s[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// containsFold reports whether b contains sub ignoring ASCII case.
+func containsFold(b []byte, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	for i := 0; i+len(sub) <= len(b); i++ {
+		if foldEq(b[i:i+len(sub)], sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseUint parses a decimal Content-Length value; false on any
+// non-digit (the old code's Atoi failed the same way).
+func parseUint(b []byte) (int, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	n := 0
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+		if n > 64*1024*1024 {
+			return 0, false
+		}
+	}
+	return n, true
+}
+
+// trimCRLF strips one trailing \n and one trailing \r from a line.
+func trimCRLF(b []byte) []byte {
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+	}
+	if len(b) > 0 && b[len(b)-1] == '\r' {
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
+// readLineSlice reads one LF-terminated line without allocating: the
+// slice aliases the bufio buffer and is valid until the next read, so
+// callers copy what they keep. A line longer than the buffer falls
+// back to an accumulating read.
+func readLineSlice(br *bufio.Reader) ([]byte, error) {
+	line, err := br.ReadSlice('\n')
+	if err == nil {
+		return line, nil
+	}
+	if err == io.EOF {
+		if len(line) == 0 {
+			return nil, io.EOF
+		}
+		return line, nil
+	}
+	if err != bufio.ErrBufferFull {
+		return nil, err
+	}
+	out := append([]byte(nil), line...)
+	for err == bufio.ErrBufferFull {
+		line, err = br.ReadSlice('\n')
+		out = append(out, line...)
+	}
+	if err == io.EOF {
+		return out, nil
+	}
+	return out, err
 }
 
 // response is a fully built HTTP response.
@@ -77,46 +176,77 @@ func (s *server) serveConn(conn net.Conn) {
 // readRequestConn reads one request, answering 100-continue inline when the
 // client asks for it. keepAlive reports whether to serve another request.
 func readRequestConn(conn net.Conn, br *bufio.Reader) (*request, bool, error) {
-	line, err := readLine(br)
+	line, err := readLineSlice(br)
 	if err != nil {
 		return nil, false, err
 	}
-	parts := strings.SplitN(line, " ", 3)
-	if len(parts) != 3 {
+	line = trimCRLF(line)
+	sp1 := bytes.IndexByte(line, ' ')
+	if sp1 < 0 {
 		return nil, false, errBadRequest
 	}
-	rq := &request{method: parts[0], headers: map[string]string{}}
-	rawURL := parts[1]
-	if i := strings.IndexByte(rawURL, '?'); i >= 0 {
-		rq.rawPath = rawURL[:i]
-		rq.query = rawURL[i+1:]
+	sp2 := bytes.IndexByte(line[sp1+1:], ' ')
+	if sp2 < 0 {
+		return nil, false, errBadRequest
+	}
+	sp2 += sp1 + 1
+	rq := &request{method: string(line[:sp1]), contentLength: -1}
+	rawURL := line[sp1+1 : sp2]
+	rq.http10 = string(line[sp2+1:]) == "HTTP/1.0"
+	if i := bytes.IndexByte(rawURL, '?'); i >= 0 {
+		rq.rawPath = string(rawURL[:i])
+		rq.query = string(rawURL[i+1:])
 	} else {
-		rq.rawPath = rawURL
+		rq.rawPath = string(rawURL)
 	}
 	rq.path = urlDecodePath(rq.rawPath)
 	rq.segments = splitPath(rq.path)
 	for {
-		hl, err := readLine(br)
+		hl, err := readLineSlice(br)
 		if err != nil {
 			return nil, false, err
 		}
-		if hl == "" {
+		hl = trimCRLF(hl)
+		if len(hl) == 0 {
 			break
 		}
-		colon := strings.IndexByte(hl, ':')
+		colon := bytes.IndexByte(hl, ':')
 		if colon < 0 {
 			continue
 		}
-		key := strings.ToLower(strings.TrimSpace(hl[:colon]))
-		val := strings.TrimSpace(hl[colon+1:])
-		if prev, ok := rq.headers[key]; ok {
-			rq.headers[key] = prev + ", " + val
-		} else {
-			rq.headers[key] = val
+		key := bytes.TrimSpace(hl[:colon])
+		val := bytes.TrimSpace(hl[colon+1:])
+		switch {
+		case foldEq(key, "authorization"):
+			rq.auth = string(val)
+		case foldEq(key, "host"):
+			rq.host = string(val)
+		case foldEq(key, "content-length"):
+			n, ok := parseUint(val)
+			if !ok {
+				return nil, false, errBadRequest
+			}
+			rq.contentLength = n
+		case foldEq(key, "transfer-encoding"):
+			if containsFold(val, "chunked") {
+				rq.chunked = true
+			}
+		case foldEq(key, "expect"):
+			if containsFold(val, "100-continue") {
+				rq.expectContinue = true
+			}
+		case foldEq(key, "connection"):
+			if containsFold(val, "close") {
+				rq.connClose = true
+			}
+			if containsFold(val, "keep-alive") {
+				rq.connKeepAlive = true
+			}
+		case foldEq(key, "git-protocol"):
+			rq.gitProtocol = string(val)
 		}
 	}
-	rq.host = rq.header("host")
-	if strings.Contains(strings.ToLower(rq.header("expect")), "100-continue") {
+	if rq.expectContinue {
 		conn.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
 	}
 	// body
@@ -128,17 +258,17 @@ func readRequestConn(conn net.Conn, br *bufio.Reader) (*request, bool, error) {
 	// keep-alive: HTTP/1.1 default on unless Connection: close; HTTP/1.0
 	// default off unless Connection: keep-alive.
 	keepAlive := true
-	if strings.Contains(strings.ToLower(rq.header("connection")), "close") {
+	if rq.connClose {
 		keepAlive = false
 	}
-	if parts[2] == "HTTP/1.0" && !strings.Contains(strings.ToLower(rq.header("connection")), "keep-alive") {
+	if rq.http10 && !rq.connKeepAlive {
 		keepAlive = false
 	}
 	return rq, keepAlive, nil
 }
 
 func readBody(br *bufio.Reader, rq *request) ([]byte, error) {
-	if te := strings.ToLower(rq.header("transfer-encoding")); strings.Contains(te, "chunked") {
+	if rq.chunked {
 		var out []byte
 		for {
 			line, err := readLine(br)
@@ -180,12 +310,11 @@ func readBody(br *bufio.Reader, rq *request) ([]byte, error) {
 			}
 		}
 	}
-	cl := rq.header("content-length")
-	if cl == "" {
+	if rq.contentLength < 0 {
 		return nil, nil
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(cl))
-	if err != nil || n < 0 || n > 64*1024*1024 {
+	n := rq.contentLength
+	if n > 64*1024*1024 {
 		return nil, errBadRequest
 	}
 	if n == 0 {
